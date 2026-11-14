@@ -28,3 +28,10 @@ Short records of choices made during the local first rework. Newest at the botto
   - resizing uses Catmull-Rom (bicubic); the reference uses PIL bicubic, so scores can differ slightly
 - **HEIC:** the `image` crate can't decode it, so HEIC files are converted with macOS's built-in `/usr/bin/sips` first. This only works on macOS.
 - **Audio encoder:** not used. Audio and video go through Whisper, and the transcript is embedded as text. That keeps timestamps for snippets, avoids a 340 MB download, and gets past the audio encoder's short input window.
+
+## Transcription: whisper-rs + symphonia, no sidecars (Phase 4)
+
+- **Whisper** is linked in through `whisper-rs 0.16` (whisper.cpp, Metal), with the `ggml-base.bin` model from the models dir. This replaces the rework doc's "bundle whisper-cli and ffmpeg as sidecars": there are no extra binaries to ship or sign, and no fetch script. Building needs `cmake`, which GitHub's macOS runners already have.
+- **Decoding** is done by `symphonia 0.6` (wav, mp3, AAC in m4a/mp4/mov), with a mono downmix and `rubato 5` FFT resampling to 16 kHz. This replaces ffmpeg. Known limit: HE-AAC isn't supported, so those files are recorded as failed and the queue moves on.
+- **Whisper is loaded per file, not cached.** A context kept alive until exit makes ggml's Metal teardown abort (`GGML_ASSERT` in `ggml-metal-device.m`), which would crash the app on quit. Loading takes well under a second, so it's small next to transcription.
+- **Verified:** speech made with macOS `say` was transcribed word for word from both WAV (44.1 kHz) and AAC/m4a, with segment timestamps.

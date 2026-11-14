@@ -36,6 +36,9 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 quick-xml = "0.42"
 sha2 = "0.10"
+whisper-rs = { version = "0.16", features = ["metal"] }
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "wav", "pcm"] }
+rubato = "5"
 
 [features]
 default = ["custom-protocol"]

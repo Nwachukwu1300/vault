@@ -6,7 +6,7 @@
 use crate::database::{FileRecord, VectorDatabase};
 use crate::embedding::Embedder;
 use crate::extract::document_text;
-use crate::transcription::{transcribe_audio, transcribe_video};
+use crate::transcription::transcribe;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -424,12 +424,9 @@ async fn process_file(
             (Some(text), String::new())
         }
         Priority::Image => (None, String::new()),
-        Priority::Audio => {
-            let t = transcribe_audio(path).await?;
-            (Some(t.clone()), t)
-        }
-        Priority::Video => {
-            let t = transcribe_video(path).await?;
+        Priority::Audio | Priority::Video => {
+            let segments = transcribe(path).await?;
+            let t = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
             (Some(t.clone()), t)
         }
     };

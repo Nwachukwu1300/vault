@@ -1,196 +1,197 @@
-//! Audio/Video transcription module using Whisper.cpp
+//! Local speech-to-text with no external tools.
 //!
-//! This module handles transcription of audio and video files using a local
-//! Whisper model. Videos are first converted to audio, then transcribed.
+//! Audio (and the audio track of mp4/mov) is decoded with symphonia,
+//! downmixed to mono, resampled to 16 kHz with rubato, then transcribed by
+//! whisper.cpp linked in through `whisper-rs` (Metal on Apple Silicon).
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use tokio::fs;
-use uuid::Uuid;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler};
+use serde::Serialize;
+use std::fs::File;
+use std::path::Path;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-/// Get the path to the whisper model file
-fn get_model_path() -> Result<PathBuf, String> {
-    // Check common locations for whisper models
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+pub const WHISPER_MODEL: &str = "whisper/ggml-base.bin";
+const WHISPER_RATE: u32 = 16_000;
 
-    let possible_paths = [
-        // User's .cache directory (common download location)
-        home.join(".cache/whisper/ggml-base.bin"),
-        home.join(".cache/whisper/ggml-base.en.bin"),
-        // Application data directory
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("com.vault.app/models/ggml-base.bin"),
-        // Homebrew locations
-        PathBuf::from("/opt/homebrew/share/whisper-cpp/models/ggml-base.bin"),
-        PathBuf::from("/usr/local/share/whisper-cpp/models/ggml-base.bin"),
-        // Current directory
-        PathBuf::from("models/ggml-base.bin"),
-    ];
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TranscriptSegment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
 
-    for path in possible_paths {
-        if path.exists() {
-            return Ok(path);
+/// Loaded per file and dropped after: a context kept alive until process
+/// exit makes ggml's Metal teardown abort (GGML_ASSERT in ggml-metal-device.m).
+fn load_whisper() -> Result<WhisperContext, String> {
+    whisper_rs::install_logging_hooks(); // keep whisper.cpp's chatter off stderr
+    let path = crate::models::models_dir().join(WHISPER_MODEL);
+    WhisperContext::new_with_params(&path, WhisperContextParameters::default())
+        .map_err(|e| format!("Failed to load Whisper model: {e}"))
+}
+
+/// Transcribe an audio or video file. A file with no audio track (or only
+/// silence) yields no segments rather than an error.
+pub async fn transcribe(path: &Path) -> Result<Vec<TranscriptSegment>, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Some(samples) = decode_mono_16k(&path)? else {
+            return Ok(Vec::new());
+        };
+        run_whisper(&samples)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn run_whisper(samples: &[f32]) -> Result<Vec<TranscriptSegment>, String> {
+    let ctx = load_whisper()?;
+    let mut state = ctx.create_state().map_err(|e| format!("Whisper state error: {e}"))?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("auto"));
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    state
+        .full(params, samples)
+        .map_err(|e| format!("Transcription failed: {e}"))?;
+
+    let mut segments = Vec::new();
+    for seg in state.as_iter() {
+        let text = seg.to_str_lossy().map_err(|e| e.to_string())?.trim().to_string();
+        if !text.is_empty() {
+            // whisper timestamps are in centiseconds
+            segments.push(TranscriptSegment {
+                start_ms: seg.start_timestamp() * 10,
+                end_ms: seg.end_timestamp() * 10,
+                text,
+            });
         }
     }
-
-    Err(
-        "Whisper model not found. Please download a model:\n\
-        curl -L -o ~/.cache/whisper/ggml-base.bin \\\n\
-          https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin\n\n\
-        Or visit: https://huggingface.co/ggerganov/whisper.cpp/tree/main".to_string()
-    )
+    Ok(segments)
 }
 
-/// Transcribe an audio file using Whisper.cpp
-///
-/// For the MVP, we use the whisper-cli command-line tool which should be installed
-/// on the system. The tool handles chunking internally for files longer than 80s.
-pub async fn transcribe_audio(audio_path: &Path) -> Result<String, String> {
-    // Check if whisper is available
-    let whisper_path = find_whisper_binary()?;
-
-    // Find the model file
-    let model_path = get_model_path()?;
-
-    // Create a temporary output file path
-    let temp_dir = std::env::temp_dir();
-    let output_id = Uuid::new_v4();
-    let output_base = temp_dir.join(format!("vault_whisper_{}", output_id));
-
-    // Run whisper-cli on the audio file
-    // whisper-cli uses different flags than the Python whisper
-    let output = Command::new(&whisper_path)
-        .args([
-            "-m", model_path.to_str().unwrap(),
-            "-f", audio_path.to_str().unwrap(),
-            "-of", output_base.to_str().unwrap(),
-            "-otxt",  // Output as text file
-            "-np",    // No progress output
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run Whisper: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!("Whisper transcription failed:\nstderr: {}\nstdout: {}", stderr, stdout));
+/// Decode the default audio track to 16 kHz mono f32. `None` if the file has
+/// no audio track.
+fn decode_mono_16k(path: &Path) -> Result<Option<Vec<f32>>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open media: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
     }
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+        .map_err(|e| format!("Unsupported media format: {e}"))?;
 
-    // whisper-cli outputs to output_base.txt
-    let output_txt = PathBuf::from(format!("{}.txt", output_base.display()));
+    let Some(track) = format.default_track(TrackType::Audio) else {
+        return Ok(None);
+    };
+    let track_id = track.id;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or("Audio track has no codec parameters")?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("Unsupported audio codec (HE-AAC is not supported): {e}"))?;
 
-    // Read the transcript
-    let transcript = fs::read_to_string(&output_txt)
-        .await
-        .map_err(|e| format!("Failed to read transcript from {}: {}", output_txt.display(), e))?;
-
-    // Clean up temp file
-    let _ = fs::remove_file(&output_txt).await;
-
-    Ok(transcript.trim().to_string())
-}
-
-/// Extract audio from a video file and transcribe it
-pub async fn transcribe_video(video_path: &Path) -> Result<String, String> {
-    // First, extract audio from video using ffmpeg
-    let audio_path = extract_audio_from_video(video_path).await?;
-
-    // Then transcribe the extracted audio
-    let transcript = transcribe_audio(&audio_path).await;
-
-    // Clean up the temporary audio file
-    let _ = fs::remove_file(&audio_path).await;
-
-    transcript
-}
-
-/// Extract audio track from video file using ffmpeg
-async fn extract_audio_from_video(video_path: &Path) -> Result<PathBuf, String> {
-    let ffmpeg_path = find_ffmpeg_binary()?;
-
-    // Create a temporary audio file
-    let temp_dir = std::env::temp_dir();
-    let audio_id = Uuid::new_v4();
-    let audio_path = temp_dir.join(format!("vault_audio_{}.wav", audio_id));
-
-    // Extract audio using ffmpeg
-    // -vn: no video
-    // -acodec pcm_s16le: 16-bit PCM audio (WAV format)
-    // -ar 16000: 16kHz sample rate (optimal for Whisper)
-    // -ac 1: mono audio
-    let output = Command::new(&ffmpeg_path)
-        .args([
-            "-i", video_path.to_str().unwrap(),
-            "-vn",
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            "-y", // Overwrite output file
-            audio_path.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Audio extraction failed: {}", stderr));
-    }
-
-    Ok(audio_path)
-}
-
-/// Find the Whisper binary on the system
-fn find_whisper_binary() -> Result<String, String> {
-    // Check common locations for whisper-cli (the actual binary name from whisper-cpp)
-    let possible_paths = [
-        "whisper-cli",                       // In PATH (Homebrew whisper-cpp)
-        "/opt/homebrew/bin/whisper-cli",    // Homebrew on Apple Silicon
-        "/usr/local/bin/whisper-cli",       // Homebrew on Intel Mac
-        "whisper",                           // Alternative name
-        "/usr/local/bin/whisper",
-        "/opt/homebrew/bin/whisper",
-    ];
-
-    for path in possible_paths {
-        if Command::new(path).arg("--help").output().is_ok() {
-            return Ok(path.to_string());
+    let mut mono = Vec::new();
+    let mut rate = 0;
+    let mut buf: Vec<f32> = Vec::new();
+    while let Some(packet) = format.next_packet().map_err(|e| format!("Failed to read media: {e}"))? {
+        if packet.track_id != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(audio) => {
+                rate = audio.spec().rate();
+                let channels = audio.spec().channels().count().max(1);
+                buf.resize(audio.samples_interleaved(), 0.0);
+                audio.copy_to_slice_interleaved(&mut buf);
+                mono.extend(downmix(&buf, channels));
+            }
+            // A corrupt packet loses a few ms of audio; keep going.
+            Err(SymphoniaError::DecodeError(_)) => {}
+            Err(e) => return Err(format!("Audio decode failed: {e}")),
         }
     }
-
-    // If whisper isn't found, provide installation instructions
-    Err(
-        "Whisper not found. Please install whisper.cpp:\n\
-        brew install whisper-cpp\n\
-        Or download from: https://github.com/ggerganov/whisper.cpp".to_string()
-    )
+    if mono.is_empty() {
+        return Ok(None);
+    }
+    resample(&mono, rate).map(Some)
 }
 
-/// Find ffmpeg binary on the system
-fn find_ffmpeg_binary() -> Result<String, String> {
-    let possible_paths = [
-        "ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/opt/homebrew/bin/ffmpeg",
-    ];
+fn downmix(interleaved: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_ {
+    interleaved
+        .chunks_exact(channels)
+        .map(move |frame| frame.iter().sum::<f32>() / channels as f32)
+}
 
-    for path in possible_paths {
-        if Command::new(path).arg("-version").output().is_ok() {
-            return Ok(path.to_string());
-        }
+fn resample(mono: &[f32], rate: u32) -> Result<Vec<f32>, String> {
+    if rate == WHISPER_RATE {
+        return Ok(mono.to_vec());
+    }
+    let mut resampler = Fft::<f32>::new(rate as usize, WHISPER_RATE as usize, 1024, 1, FixedSync::Input)
+        .map_err(|e| format!("Resampler error: {e}"))?;
+    let input = InterleavedSlice::new(mono, 1, mono.len()).map_err(|e| e.to_string())?;
+    let output = resampler
+        .process_all(&input, mono.len(), None)
+        .map_err(|e| format!("Resample failed: {e}"))?;
+    Ok(output.take_data())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downmix_averages_channels() {
+        let stereo = [1.0, 0.0, 0.5, 0.5, -1.0, 1.0];
+        assert_eq!(downmix(&stereo, 2).collect::<Vec<_>>(), vec![0.5, 0.5, 0.0]);
     }
 
-    Err(
-        "ffmpeg not found. Please install ffmpeg:\n\
-        brew install ffmpeg\n\
-        Or download from: https://ffmpeg.org/download.html".to_string()
-    )
-}
+    #[test]
+    fn resample_48k_to_16k_keeps_duration() {
+        let one_second: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin()).collect();
+        let out = resample(&one_second, 48_000).unwrap();
+        assert!((out.len() as i64 - 16_000).abs() < 50, "{}", out.len());
+    }
 
-/// Check if transcription dependencies are available
-pub fn check_dependencies() -> Result<(), String> {
-    find_whisper_binary()?;
-    find_ffmpeg_binary()?;
-    get_model_path()?;
-    Ok(())
+    /// Needs the Whisper model. Generates speech with macOS `say` as WAV
+    /// (44.1 kHz) and AAC in an m4a container, so both resampling and the
+    /// AAC/mp4 path are exercised.
+    #[tokio::test]
+    #[ignore]
+    async fn transcribes_wav_and_m4a() {
+        let dir = tempfile::tempdir().unwrap();
+        let phrase = "The quarterly budget meeting moved to Thursday.";
+        for (name, fmt) in [("speech.wav", "LEI16@44100"), ("speech.m4a", "aac")] {
+            let out = dir.path().join(name);
+            let ok = std::process::Command::new("say")
+                .args(["-o"])
+                .arg(&out)
+                .args(["--data-format", fmt, phrase])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "say failed for {name}");
+
+            let start = std::time::Instant::now();
+            let segs = transcribe(&out).await.unwrap();
+            let text = segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+            println!("{name} ({:?}): {text:?} {segs:?}", start.elapsed());
+            let lower = text.to_lowercase();
+            assert!(lower.contains("budget") && lower.contains("thursday"), "{text}");
+            assert!(segs[0].end_ms > segs[0].start_ms);
+        }
+    }
 }
