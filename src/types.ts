@@ -30,3 +30,15 @@ export interface IndexingProgress {
   current_file: string | null;
   last_error: string | null;
 }
+
+export interface ModelStatus {
+  ready: boolean;
+  total_bytes: number;
+  missing_bytes: number;
+}
+
+export interface DownloadProgress {
+  file: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+}

@@ -7,7 +7,8 @@ import Onboarding from "./components/Onboarding";
 import EstimateScreen from "./components/EstimateScreen";
 import EmptyFoldersMessage from "./components/EmptyFoldersMessage";
 import IndexingProgressBar from "./components/IndexingProgressBar";
-import { AppConfig, ScanResult, IndexingProgress } from "./types";
+import ModelDownload from "./components/ModelDownload";
+import { AppConfig, ScanResult, IndexingProgress, ModelStatus } from "./types";
 
 export type FileCategory = "all" | "images" | "videos" | "audio" | "documents";
 
@@ -21,6 +22,7 @@ function App() {
   const [folders, setFolders] = useState<string[]>([]);
   const [indexingProgress, setIndexingProgress] = useState<IndexingProgress | null>(null);
   const [indexingComplete, setIndexingComplete] = useState(false);
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
 
   // Listen for indexing progress events from backend
   useEffect(() => {
@@ -53,6 +55,7 @@ function App() {
     try {
       // Initialize database on app start
       await invoke("init_database");
+      setModelStatus(await invoke<ModelStatus>("get_model_status"));
 
       const config = await invoke<AppConfig | null>("load_config");
 
@@ -169,6 +172,10 @@ function App() {
         <div className="animate-pulse text-zinc-400">Loading...</div>
       </div>
     );
+  }
+
+  if (modelStatus && !modelStatus.ready) {
+    return <ModelDownload status={modelStatus} onReady={() => setModelStatus({ ...modelStatus, ready: true })} />;
   }
 
   if (showOnboarding) {

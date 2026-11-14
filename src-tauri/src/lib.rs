@@ -13,6 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Emitter;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{OnceCell, RwLock};
 use walkdir::WalkDir;
 
@@ -46,6 +47,7 @@ pub struct AppState {
     indexer: Arc<RwLock<Option<Indexer>>>,
     /// Loaded on first use and kept warm so searches don't pay the load cost.
     embedder: OnceCell<Arc<Embedder>>,
+    cancel_download: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -400,6 +402,26 @@ async fn scan_folders(folders: Vec<String>) -> Result<ScanResult, String> {
 
 /// Initialize the database
 #[tauri::command]
+fn get_model_status() -> models::ModelStatus {
+    models::status(&models::models_dir(), models::MANIFEST)
+}
+
+/// Download missing model files, emitting `model-download-progress` events.
+#[tauri::command]
+async fn download_models(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.cancel_download.store(false, Ordering::Relaxed);
+    models::download_all(&models::models_dir(), models::MANIFEST, &state.cancel_download, |p| {
+        let _ = app.emit("model-download-progress", p);
+    })
+    .await
+}
+
+#[tauri::command]
+fn cancel_model_download(state: tauri::State<'_, AppState>) {
+    state.cancel_download.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
 async fn init_database(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db_path = get_database_path();
 
@@ -541,9 +563,13 @@ pub fn run() {
             database: Arc::new(RwLock::new(None)),
             indexer: Arc::new(RwLock::new(None)),
             embedder: OnceCell::new(),
+            cancel_download: Arc::new(AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
             validate_api_key,
+            get_model_status,
+            download_models,
+            cancel_model_download,
             save_optional_api_key,
             get_optional_api_key,
             delete_optional_api_key,
