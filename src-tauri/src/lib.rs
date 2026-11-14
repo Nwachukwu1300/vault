@@ -13,10 +13,16 @@ use tauri::Emitter;
 use tokio::sync::RwLock;
 use walkdir::WalkDir;
 
+/// Bump whenever the on-disk index layout changes; older indexes are wiped and rebuilt.
+const SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub folders: Vec<String>,
     pub onboarding_complete: bool,
+    /// Missing in configs written before versioning existed, which reads as 0.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 /// Results from scanning folders for supported files
@@ -42,6 +48,7 @@ impl Default for AppConfig {
         Self {
             folders: Vec::new(),
             onboarding_complete: false,
+            schema_version: SCHEMA_VERSION,
         }
     }
 }
@@ -164,16 +171,18 @@ async fn clear_index(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn save_config(folders: Vec<String>) -> Result<(), String> {
-    let config = AppConfig {
+    write_config(&AppConfig {
         folders,
         onboarding_complete: true,
-    };
+        schema_version: SCHEMA_VERSION,
+    })
+}
 
-    let config_path = get_config_path();
-    let json = serde_json::to_string_pretty(&config)
+fn write_config(config: &AppConfig) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-    fs::write(&config_path, json)
+    fs::write(get_config_path(), json)
         .map_err(|e| format!("Failed to write config file: {}", e))
 }
 
@@ -373,6 +382,20 @@ async fn scan_folders(folders: Vec<String>) -> Result<ScanResult, String> {
 #[tauri::command]
 async fn init_database(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let db_path = get_database_path();
+
+    // An index built with an older schema can't be read; wipe it so the
+    // frontend sees 0 indexed files and offers a rebuild via the estimate screen.
+    if let Some(mut config) = load_config().await? {
+        if config.schema_version < SCHEMA_VERSION {
+            if db_path.exists() {
+                fs::remove_dir_all(&db_path)
+                    .map_err(|e| format!("Failed to clear old index: {}", e))?;
+            }
+            config.schema_version = SCHEMA_VERSION;
+            write_config(&config)?;
+        }
+    }
+
     let db = VectorDatabase::open(db_path).await?;
     *state.database.write().await = Some(Arc::new(db));
     Ok(())
@@ -522,4 +545,17 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_without_schema_version_needs_rebuild() {
+        let old: AppConfig =
+            serde_json::from_str(r#"{"folders":["/tmp"],"onboarding_complete":true}"#).unwrap();
+        assert_eq!(old.schema_version, 0);
+        assert!(old.schema_version < SCHEMA_VERSION);
+    }
 }

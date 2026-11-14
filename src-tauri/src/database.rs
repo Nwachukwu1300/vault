@@ -4,7 +4,7 @@
 //! LanceDB stores 3072-dimension vectors alongside file metadata.
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
     TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -103,13 +103,8 @@ impl VectorDatabase {
                 .await
                 .map_err(|e| format!("Failed to open table: {}", e))?
         } else {
-            // Create empty table with schema
-            let schema = Self::get_schema();
-            let batch = RecordBatch::new_empty(schema.clone());
-            let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-
             self.connection
-                .create_table(TABLE_NAME, Box::new(batches))
+                .create_empty_table(TABLE_NAME, Self::get_schema())
                 .execute()
                 .await
                 .map_err(|e| format!("Failed to create table: {}", e))?
@@ -124,11 +119,10 @@ impl VectorDatabase {
         let table = self.get_table().await?;
 
         let schema = Self::get_schema();
-        let batch = Self::record_to_batch(&record, schema.clone())?;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let batch = Self::record_to_batch(&record, schema)?;
 
         table
-            .add(Box::new(batches))
+            .add(batch)
             .execute()
             .await
             .map_err(|e| format!("Failed to insert record: {}", e))?;
@@ -213,18 +207,10 @@ impl VectorDatabase {
     pub async fn count(&self) -> Result<usize, String> {
         let table = self.get_table().await?;
 
-        let results = table
-            .query()
-            .execute()
+        table
+            .count_rows(None)
             .await
-            .map_err(|e| format!("Failed to count: {}", e))?;
-
-        let batches: Vec<RecordBatch> = results
-            .try_collect()
-            .await
-            .map_err(|e| format!("Failed to collect: {}", e))?;
-
-        Ok(batches.iter().map(|b| b.num_rows()).sum())
+            .map_err(|e| format!("Failed to count: {}", e))
     }
 
     /// Get the table, returning an error if not initialized

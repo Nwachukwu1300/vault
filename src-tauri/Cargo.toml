@@ -24,9 +24,9 @@ tokio = { version = "1", features = ["full", "sync"] }
 keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 dirs = "5"
 walkdir = "2"
-lancedb = "0.5"
-arrow-array = "51"
-arrow-schema = "51"
+lancedb = "0.41"
+arrow-array = "58"
+arrow-schema = "58"
 futures = "0.3"
 chrono = { version = "0.4.35", features = ["serde"] }
 base64 = "0.21"
