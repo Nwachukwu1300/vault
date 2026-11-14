@@ -33,5 +33,6 @@ Short records of choices made during the local first rework. Newest at the botto
 
 - **Whisper** is linked in through `whisper-rs 0.16` (whisper.cpp, Metal), with the `ggml-base.bin` model from the models dir. This replaces the rework doc's "bundle whisper-cli and ffmpeg as sidecars": there are no extra binaries to ship or sign, and no fetch script. Building needs `cmake`, which GitHub's macOS runners already have.
 - **Decoding** is done by `symphonia 0.6` (wav, mp3, AAC in m4a/mp4/mov), with a mono downmix and `rubato 5` FFT resampling to 16 kHz. This replaces ffmpeg. Known limit: HE-AAC isn't supported, so those files are recorded as failed and the queue moves on.
+- **Bounded memory:** audio is resampled to 16 kHz in 30-second blocks while decoding, transcription stops at 2 hours of audio, and sample rates outside 8 to 192 kHz (or changing mid-stream) are rejected. Before this, a long or malformed file could use gigabytes of RAM.
 - **Whisper is loaded per file, not cached.** A context kept alive until exit makes ggml's Metal teardown abort (`GGML_ASSERT` in `ggml-metal-device.m`), which would crash the app on quit. Loading takes well under a second, so it's small next to transcription.
 - **Verified:** speech made with macOS `say` was transcribed word for word from both WAV (44.1 kHz) and AAC/m4a, with segment timestamps.

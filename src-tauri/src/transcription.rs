@@ -19,6 +19,14 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 pub const WHISPER_MODEL: &str = "whisper/ggml-base.bin";
 const WHISPER_RATE: u32 = 16_000;
+/// Rates outside this range are corrupt or hostile headers, not real audio.
+const RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
+/// shortcut: audio past 2 hours is not transcribed (bounds memory to ~460 MB
+/// of 16 kHz samples); stream into whisper in windows if longer files matter.
+const MAX_SECONDS: usize = 2 * 60 * 60;
+/// Resample in blocks of this many seconds so the full-rate track is never
+/// held in memory.
+const BLOCK_SECONDS: usize = 30;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TranscriptSegment {
@@ -104,30 +112,46 @@ fn decode_mono_16k(path: &Path) -> Result<Option<Vec<f32>>, String> {
         .make_audio_decoder(params, &AudioDecoderOptions::default())
         .map_err(|e| format!("Unsupported audio codec (HE-AAC is not supported): {e}"))?;
 
-    let mut mono = Vec::new();
-    let mut rate = 0;
+    let mut out: Vec<f32> = Vec::new();
+    let mut block: Vec<f32> = Vec::new();
+    let mut rate: Option<u32> = None;
     let mut buf: Vec<f32> = Vec::new();
+    let max_out = MAX_SECONDS * WHISPER_RATE as usize;
     while let Some(packet) = format.next_packet().map_err(|e| format!("Failed to read media: {e}"))? {
         if packet.track_id != track_id {
             continue;
         }
-        match decoder.decode(&packet) {
-            Ok(audio) => {
-                rate = audio.spec().rate();
-                let channels = audio.spec().channels().count().max(1);
-                buf.resize(audio.samples_interleaved(), 0.0);
-                audio.copy_to_slice_interleaved(&mut buf);
-                mono.extend(downmix(&buf, channels));
-            }
+        let audio = match decoder.decode(&packet) {
+            Ok(audio) => audio,
             // A corrupt packet loses a few ms of audio; keep going.
-            Err(SymphoniaError::DecodeError(_)) => {}
+            Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(format!("Audio decode failed: {e}")),
+        };
+        let r = audio.spec().rate();
+        match rate {
+            None if RATE_RANGE.contains(&r) => rate = Some(r),
+            None => return Err(format!("Unsupported sample rate: {r} Hz")),
+            Some(prev) if prev != r => return Err("Sample rate changes mid-stream".into()),
+            Some(_) => {}
+        }
+        let channels = audio.spec().channels().count().max(1);
+        buf.resize(audio.samples_interleaved(), 0.0);
+        audio.copy_to_slice_interleaved(&mut buf);
+        block.extend(downmix(&buf, channels));
+
+        if block.len() >= r as usize * BLOCK_SECONDS {
+            out.extend(resample(&block, r)?);
+            block.clear();
+            if out.len() >= max_out {
+                break;
+            }
         }
     }
-    if mono.is_empty() {
-        return Ok(None);
+    if let (Some(r), false) = (rate, block.is_empty()) {
+        out.extend(resample(&block, r)?);
     }
-    resample(&mono, rate).map(Some)
+    out.truncate(max_out);
+    Ok((!out.is_empty()).then_some(out))
 }
 
 fn downmix(interleaved: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_ {
@@ -164,6 +188,48 @@ mod tests {
         let one_second: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin()).collect();
         let out = resample(&one_second, 48_000).unwrap();
         assert!((out.len() as i64 - 16_000).abs() < 50, "{}", out.len());
+    }
+
+    /// A 70 s file at 44.1 kHz crosses two block boundaries; output length
+    /// must still match the duration at 16 kHz.
+    #[test]
+    fn block_resampling_keeps_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_wav(dir.path(), 44_100, 44_100 * 70);
+        let out = decode_mono_16k(&path).unwrap().unwrap();
+        assert!((out.len() as i64 - 16_000 * 70).abs() < 2_000, "{}", out.len());
+    }
+
+    #[test]
+    fn rejects_absurd_sample_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_wav(dir.path(), 4_000_000, 1_000);
+        let err = decode_mono_16k(&path).unwrap_err();
+        assert!(err.contains("sample rate"), "{err}");
+    }
+
+    /// Mono 16-bit PCM WAV with a sine tone.
+    fn write_wav(dir: &Path, rate: u32, frames: usize) -> std::path::PathBuf {
+        let path = dir.join("tone.wav");
+        let data: Vec<u8> = (0..frames)
+            .flat_map(|i| (((i as f32 * 0.03).sin() * 8000.0) as i16).to_le_bytes())
+            .collect();
+        let mut wav = Vec::new();
+        wav.extend(b"RIFF");
+        wav.extend((36 + data.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes()); // PCM
+        wav.extend(1u16.to_le_bytes()); // mono
+        wav.extend(rate.to_le_bytes());
+        wav.extend((rate * 2).to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((data.len() as u32).to_le_bytes());
+        wav.extend(data);
+        std::fs::write(&path, wav).unwrap();
+        path
     }
 
     /// Needs the Whisper model. Generates speech with macOS `say` as WAV
