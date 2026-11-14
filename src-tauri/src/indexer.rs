@@ -4,7 +4,8 @@
 //! Files are processed in order: Documents first, then Images, then Audio/Video.
 
 use crate::database::{FileRecord, VectorDatabase};
-use crate::embedding::{EmbeddingClient, TaskType};
+use crate::embedding::Embedder;
+use crate::extract::document_text;
 use crate::transcription::{transcribe_audio, transcribe_video};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -15,15 +16,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 use walkdir::WalkDir;
-
-// ============================================================================
-// RATE LIMITING CONFIGURATION
-// ============================================================================
-// Adjust these values based on your Gemini API quota.
-// Default: 60 requests per minute (1 request per second)
-// ============================================================================
-const REQUESTS_PER_MINUTE: u32 = 60;
-const MIN_REQUEST_INTERVAL_MS: u64 = (60_000 / REQUESTS_PER_MINUTE as u64) + 50; // Add 50ms buffer
 
 /// Directories to skip during indexing
 const SKIP_DIRECTORIES: &[&str] = &[
@@ -146,7 +138,7 @@ pub enum IndexerCommand {
 /// The main indexer that manages the embedding pipeline
 pub struct Indexer {
     database: Arc<VectorDatabase>,
-    api_key: String,
+    embedder: Arc<Embedder>,
     progress: Arc<RwLock<IndexingProgress>>,
     command_tx: Option<mpsc::Sender<IndexerCommand>>,
     queue: Arc<RwLock<VecDeque<QueuedFile>>>,
@@ -154,10 +146,10 @@ pub struct Indexer {
 
 impl Indexer {
     /// Create a new indexer
-    pub fn new(database: Arc<VectorDatabase>, api_key: String) -> Self {
+    pub fn new(database: Arc<VectorDatabase>, embedder: Arc<Embedder>) -> Self {
         Self {
             database,
-            api_key,
+            embedder,
             progress: Arc::new(RwLock::new(IndexingProgress::default())),
             command_tx: None,
             queue: Arc::new(RwLock::new(VecDeque::new())),
@@ -240,12 +232,11 @@ impl Indexer {
         self.command_tx = Some(cmd_tx);
 
         let database = self.database.clone();
-        let api_key = self.api_key.clone();
+        let embedder = self.embedder.clone();
         let progress = self.progress.clone();
         let queue = self.queue.clone();
 
         tokio::spawn(async move {
-            let client = EmbeddingClient::new(api_key);
             let mut paused = false;
 
             // Set indexing started
@@ -309,7 +300,7 @@ impl Indexer {
 
                         // Process the file
                         println!("Indexing: {}", file.path.display());
-                        let result = process_file(&file, &client, &database).await;
+                        let result = process_file(&file, &embedder, &database).await;
                         if result.is_ok() {
                             println!("  ✓ Success");
                         }
@@ -333,9 +324,6 @@ impl Indexer {
                         };
 
                         let _ = progress_tx.send(progress_clone).await;
-
-                        // Rate limiting - wait between API calls
-                        sleep(Duration::from_millis(MIN_REQUEST_INTERVAL_MS)).await;
                     }
                     None => {
                         // Queue is empty, indexing complete
@@ -393,7 +381,7 @@ impl Indexer {
 /// Process a single file through the appropriate pipeline
 async fn process_file(
     file: &QueuedFile,
-    client: &EmbeddingClient,
+    embedder: &Arc<Embedder>,
     database: &VectorDatabase,
 ) -> Result<(), String> {
     let path = &file.path;
@@ -419,35 +407,49 @@ async fn process_file(
         }
     }
 
-    // Process based on file type
-    let (vector, transcript) = match file.priority {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Text first (extraction or transcription), then embed on a blocking
+    // thread so inference never stalls the async runtime.
+    let (text, transcript) = match file.priority {
         Priority::Document => {
-            let vector = client.embed_document(path, TaskType::RetrievalDocument).await?;
-            (vector, String::new())
+            let p = path.clone();
+            let text = tokio::task::spawn_blocking(move || document_text(&p))
+                .await
+                .map_err(|e| e.to_string())??;
+            (Some(text), String::new())
         }
-        Priority::Image => {
-            let vector = client.embed_image(path, TaskType::RetrievalDocument).await?;
-            (vector, String::new())
-        }
+        Priority::Image => (None, String::new()),
         Priority::Audio => {
-            let transcript = transcribe_audio(path).await?;
-            let vector = client.embed_text(&transcript, TaskType::RetrievalDocument).await?;
-            (vector, transcript)
+            let t = transcribe_audio(path).await?;
+            (Some(t.clone()), t)
         }
         Priority::Video => {
-            let transcript = transcribe_video(path).await?;
-            let vector = client.embed_text(&transcript, TaskType::RetrievalDocument).await?;
-            (vector, transcript)
+            let t = transcribe_video(path).await?;
+            (Some(t.clone()), t)
         }
     };
+
+    let embedder = embedder.clone();
+    let p = path.clone();
+    let title = file_name.clone();
+    let vector = tokio::task::spawn_blocking(move || match text {
+        Some(text) => embedder
+            .embed_documents(&[(Some(title.as_str()), text.as_str())])
+            .map(|mut v| v.remove(0)),
+        None => embedder.embed_image(&p),
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     // Create the record
     let record = FileRecord {
         file_path: path.to_str().unwrap().to_string(),
-        file_name: path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        file_name,
         file_type: file.file_type.clone(),
         last_modified,
         transcript,

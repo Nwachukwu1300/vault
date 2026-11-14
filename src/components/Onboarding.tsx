@@ -147,7 +147,7 @@ function Onboarding({ onComplete }: OnboardingProps) {
 
   const handleGetStarted = async () => {
     try {
-      await invoke("save_api_key", { apiKey: apiKey.trim() });
+      await invoke("save_optional_api_key", { apiKey: apiKey.trim() });
       await invoke("save_config", { folders });
       onComplete();
     } catch (error) {

@@ -1,16 +1,19 @@
 mod database;
 mod embedding;
+mod extract;
 mod indexer;
+mod models;
 mod transcription;
 
 use database::{get_database_path, VectorDatabase};
+use embedding::Embedder;
 use indexer::{Indexer, IndexingProgress};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 use walkdir::WalkDir;
 
 /// Bump whenever the on-disk index layout changes; older indexes are wiped and rebuilt.
@@ -41,6 +44,21 @@ pub struct ScanResult {
 pub struct AppState {
     database: Arc<RwLock<Option<Arc<VectorDatabase>>>>,
     indexer: Arc<RwLock<Option<Indexer>>>,
+    /// Loaded on first use and kept warm so searches don't pay the load cost.
+    embedder: OnceCell<Arc<Embedder>>,
+}
+
+impl AppState {
+    async fn embedder(&self) -> Result<Arc<Embedder>, String> {
+        self.embedder
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(|| Embedder::load(&models::models_dir()).map(Arc::new))
+                    .await
+                    .map_err(|e| e.to_string())?
+            })
+            .await
+            .cloned()
+    }
 }
 
 impl Default for AppConfig {
@@ -62,6 +80,8 @@ fn get_config_path() -> PathBuf {
     config_dir.join("config.json")
 }
 
+/// Keychain entry for an optional API key (reserved for the future Ask
+/// feature; search never needs it).
 fn get_keyring_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new("com.vault.app", "gemini-api-key")
         .map_err(|e| format!("Failed to access keyring: {}", e))
@@ -95,7 +115,7 @@ async fn validate_api_key(api_key: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn save_api_key(api_key: String) -> Result<(), String> {
+async fn save_optional_api_key(api_key: String) -> Result<(), String> {
     let entry = get_keyring_entry()?;
     entry
         .set_password(&api_key)
@@ -103,7 +123,7 @@ async fn save_api_key(api_key: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_api_key() -> Result<Option<String>, String> {
+async fn get_optional_api_key() -> Result<Option<String>, String> {
     let entry = get_keyring_entry()?;
     match entry.get_password() {
         Ok(password) => Ok(Some(password)),
@@ -112,9 +132,9 @@ async fn get_api_key() -> Result<Option<String>, String> {
     }
 }
 
-/// Delete the API key from secure storage
+/// Delete the optional API key from secure storage
 #[tauri::command]
-async fn delete_api_key() -> Result<(), String> {
+async fn delete_optional_api_key() -> Result<(), String> {
     let entry = get_keyring_entry()?;
     match entry.delete_credential() {
         Ok(_) => Ok(()),
@@ -127,7 +147,7 @@ async fn delete_api_key() -> Result<(), String> {
 #[tauri::command]
 async fn reset_app(state: tauri::State<'_, AppState>) -> Result<(), String> {
     // Delete API key
-    let _ = delete_api_key().await;
+    let _ = delete_optional_api_key().await;
 
     // Delete config file
     let config_path = get_config_path();
@@ -408,9 +428,6 @@ async fn start_indexing(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Get the API key
-    let api_key = get_api_key().await?.ok_or("No API key found")?;
-
     // Ensure database is initialized
     let db = {
         let db_guard = state.database.read().await;
@@ -418,7 +435,8 @@ async fn start_indexing(
     };
 
     // Create and configure the indexer
-    let mut indexer = Indexer::new(db, api_key);
+    let embedder = state.embedder().await?;
+    let mut indexer = Indexer::new(db, embedder);
     indexer.scan_and_queue(&folders).await?;
 
     // Start indexing and get the progress receiver
@@ -522,12 +540,13 @@ pub fn run() {
         .manage(AppState {
             database: Arc::new(RwLock::new(None)),
             indexer: Arc::new(RwLock::new(None)),
+            embedder: OnceCell::new(),
         })
         .invoke_handler(tauri::generate_handler![
             validate_api_key,
-            save_api_key,
-            get_api_key,
-            delete_api_key,
+            save_optional_api_key,
+            get_optional_api_key,
+            delete_optional_api_key,
             reset_app,
             clear_index,
             save_config,
