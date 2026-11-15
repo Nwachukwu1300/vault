@@ -5,8 +5,8 @@
 
 use crate::database::{FileRecord, VectorDatabase};
 use crate::embedding::Embedder;
-use crate::extract::document_text;
-use crate::transcription::transcribe;
+use crate::chunker::{chunk, TARGET_TOKENS};
+use crate::extract::extract;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -413,32 +413,32 @@ async fn process_file(
         .unwrap_or("unknown")
         .to_string();
 
-    // Text first (extraction or transcription), then embed on a blocking
-    // thread so inference never stalls the async runtime.
-    let (text, transcript) = match file.priority {
-        Priority::Document => {
-            let p = path.clone();
-            let text = tokio::task::spawn_blocking(move || document_text(&p))
-                .await
-                .map_err(|e| e.to_string())??;
-            (Some(text), String::new())
-        }
-        Priority::Image => (None, String::new()),
-        Priority::Audio | Priority::Video => {
-            let segments = transcribe(path).await?;
-            let t = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
-            (Some(t.clone()), t)
-        }
-    };
+    // Position-tagged text first (extraction or transcription), then chunk
+    // and embed on a blocking thread so inference never stalls the runtime.
+    let extracted = extract(path, file.priority).await?;
+    let is_image = file.priority == Priority::Image;
+    if extracted.segments.is_empty() && !is_image {
+        return Err(match file.priority {
+            Priority::Audio | Priority::Video => "No speech found".into(),
+            _ if extracted.needs_ocr => "No text found (needs OCR)".into(),
+            _ => "No text found".into(),
+        });
+    }
+    let transcript = extracted.segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
 
     let embedder = embedder.clone();
     let p = path.clone();
     let title = file_name.clone();
-    let vector = tokio::task::spawn_blocking(move || match text {
-        Some(text) => embedder
-            .embed_documents(&[(Some(title.as_str()), text.as_str())])
-            .map(|mut v| v.remove(0)),
-        None => embedder.embed_image(&p),
+    let vector = tokio::task::spawn_blocking(move || {
+        if is_image {
+            return embedder.embed_image(&p);
+        }
+        let chunks = chunk(&extracted.segments, &|t| embedder.count_tokens(t), TARGET_TOKENS);
+        // shortcut: only the first chunk is embedded until Phase 6 adds a
+        // chunks table with one row (and vector) per chunk.
+        embedder
+            .embed_documents(&[(Some(title.as_str()), chunks[0].text.as_str())])
+            .map(|mut v| v.remove(0))
     })
     .await
     .map_err(|e| e.to_string())??;

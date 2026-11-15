@@ -39,6 +39,7 @@ sha2 = "0.10"
 whisper-rs = { version = "0.16", features = ["metal"] }
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "wav", "pcm"] }
 rubato = "5"
+pdf-extract = "0.12"
 
 [features]
 default = ["custom-protocol"]
@@ -46,3 +47,8 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tempfile = "3"
+
+# Dependencies (LanceDB/DataFusion especially) carry gigabytes of debug info
+# we never step through; dropping it keeps target/ small and links fast.
+[profile.dev.package."*"]
+debug = false

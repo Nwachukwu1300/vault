@@ -84,6 +84,11 @@ impl Embedder {
         })
     }
 
+    /// Token count without special tokens, for sizing chunks.
+    pub fn count_tokens(&self, text: &str) -> usize {
+        self.tokenizer.encode(text, false).map(|e| e.len()).unwrap_or(0)
+    }
+
     pub fn embed_query(&self, query: &str) -> Result<Vec<f32>, String> {
         Ok(self.embed_texts(&[query_prompt(query)])?.remove(0))
     }

@@ -36,3 +36,10 @@ Short records of choices made during the local first rework. Newest at the botto
 - **Bounded memory:** audio is resampled to 16 kHz in 30-second blocks while decoding, transcription stops at 2 hours of audio, and sample rates outside 8 to 192 kHz (or changing mid-stream) are rejected. Before this, a long or malformed file could use gigabytes of RAM.
 - **Whisper is loaded per file, not cached.** A context kept alive until exit makes ggml's Metal teardown abort (`GGML_ASSERT` in `ggml-metal-device.m`), which would crash the app on quit. Loading takes well under a second, so it's small next to transcription.
 - **Verified:** speech made with macOS `say` was transcribed word for word from both WAV (44.1 kHz) and AAC/m4a, with segment timestamps.
+
+## Extraction and chunking (Phase 5)
+
+- **PDF text:** `pdf-extract 0.12`, one segment per page so results can say "page 4". A page with no text layer marks the file `needs_ocr` (OCR comes later). It runs on a blocking thread, so a parser panic on a malformed PDF fails that file instead of crashing the app. PDFs over 200 MB are skipped, because pdf-extract loads the whole file into memory.
+- **Chunks:** about 450 tokens, measured with the embedding model's own tokenizer, with 15% overlap. Text is split at paragraphs first, then sentences, then words, so a chunk never cuts a sentence unless the sentence alone is too long. Each chunk keeps its first page, and the timestamps from its first to its last segment.
+- **Until Phase 6:** the indexer embeds only the first chunk per file, because the old one-row-per-file table can't hold more.
+- **Build:** dependencies are compiled without debug info (`[profile.dev.package."*"] debug = false`). With it, the debug cache reached 25 GB, and linking stalled for 20+ minutes on a USB drive.

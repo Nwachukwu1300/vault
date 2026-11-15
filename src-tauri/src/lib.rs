@@ -1,3 +1,4 @@
+mod chunker;
 mod database;
 mod embedding;
 mod extract;
